@@ -14,6 +14,7 @@ pub mod stats_agg;
 pub mod utilities;
 pub mod time_series;
 pub mod topn;
+pub mod arbitrary;
 
 mod palloc;
 mod aggregate_utils;
