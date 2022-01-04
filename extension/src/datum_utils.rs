@@ -187,6 +187,7 @@ fn padded_va_len(ptr : *const pg_sys::varlena) -> usize {
     unsafe { round_to_multiple(varsize_any(ptr), 8) }
 }
 
+// FIXME - JOSH this should use the types text format for text IO
 flat_serialize_macro::flat_serialize! {
     #[derive(Debug, Serialize, Deserialize)]
     struct DatumStore<'input> {
@@ -197,79 +198,132 @@ flat_serialize_macro::flat_serialize! {
     }
 }
 
-// JOSH I think we should use an impl whose function is `unsafe` to call
+// impl<'a> Serialize for DatumStore<'a> {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: serde::Serializer {
+//         let mut store = serializer.serialize_struct("DatumStore", 2)?;
+//         store.serialize_field("type_oid", &self.type_oid)?;
+//         if serializer.is_human_readable() {
+//             store.serialize_field("data", self.data_as_text())
+//         } else {
+//             store.serialize_field("data_len", &self.data_len)?;
+//             store.serialize_field("data", &self.data)
+//         }
+//         store.end()
+//     }
+// }
+
+// impl<'a> DatumStore<'a> {
+//     fn data_as_text(&self) -> DataAsText<'_, 'a> {
+//         DataAsText(self)
+//     }
+// }
+
+// struct DataAsText<'a, 'i>(&'a DatumStore<'i>);
+
+// impl<'a> Serialize for DataAsText<'a> {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: serde::Serializer {
+//         let mut type_output = 0;
+//         let mut typ_is_varlena = false;
+//         let mut flinfo = unsafe {
+//             std::mem::MaybeUninit::zeroed().assume_init()
+//         };
+//         unsafe {
+//             pg_sys::getTypeOutputInfo(self.0.type_oid.0, &mut type_output, &mut typ_is_varlena);
+//             fmgr_info(type_output, &flinfo);
+//         }
+//         let count = self.0.into_iter().count();
+//         let mut seq = serializer.serialize_seq(Some(count))?;
+//         for element in self.0.into_iter() {
+//             let chars = pg_sys::OutputFunctionCall(&flinfo, element);
+//             let cstr = unsafe {
+//                 std::ffi::CStr::from_ptr(chars)
+//             };
+//             seq.serialize_element(cstr.to_str().unwrap())?;
+//         }
+//         seq.end()
+//     }
+// }
+
 impl From<(Oid, Vec<Datum>)> for DatumStore<'_> {
     fn from(input: (Oid, Vec<Datum>)) -> Self {
-        unsafe {
-            let (oid, datums) = input;
+        let (oid, datums) = input;
+        let (tlen, typbyval) = unsafe {
             let tentry = pg_sys::lookup_type_cache(oid, 0_i32);
-            let tlen = (*tentry).typlen;
-            assert!(tlen.is_positive() || tlen == -1 || tlen == -2);
+            ((*tentry).typlen, (*tentry).typbyval)
+        };
+        assert!(tlen.is_positive() || tlen == -1 || tlen == -2);
 
-            if (*tentry).typbyval {
-                // Datum by value
+        if typbyval {
+            // Datum by value
 
-                // pad entries out to 8 byte aligned values...this may be a source of inefficiency
-                let data_len = round_to_multiple(tlen as usize, 8) as u32 * datums.len() as u32; 
+            // pad entries out to 8 byte aligned values...this may be a source of inefficiency
+            let data_len = round_to_multiple(tlen as usize, 8) as u32 * datums.len() as u32;
 
-                let mut data = Vec::<u64>::new();
-                for datum in datums {
-                    data.push(datum as u64);
-                }
+            let mut data: Vec<u8> = vec![];
+            for datum in datums {
+                data.extend_from_slice(&datum.to_ne_bytes());
+            }
 
-                DatumStore {
-                    type_oid: oid.into(),
-                    data_len,
-                    data: std::slice::from_raw_parts(data.as_ptr().cast(), data_len as usize).into(),
-                }
-            } else if tlen == -1 {
-                // Varlena
+            DatumStore {
+                type_oid: oid.into(),
+                data_len,
+                data: data.into(),
+            }
+        } else if tlen == -1 {
+            // Varlena
 
-                let mut ptrs = Vec::new();
-                let mut total_data_bytes = 0;
+            let mut ptrs = Vec::new();
+            let mut total_data_bytes = 0;
 
-                for datum in datums {
+            for datum in datums {
+                unsafe {
                     let ptr = pg_sys::pg_detoast_datum_packed(datum as *mut pg_sys::varlena);
                     let va_len = varsize_any(ptr);
 
                     ptrs.push(ptr);
                     total_data_bytes += round_to_multiple(va_len, 8); // Round up to 8 byte boundary
                 }
-                        
-                let buffer = std::slice::from_raw_parts_mut(pg_sys::palloc0(total_data_bytes) as *mut u8, total_data_bytes);
+            }
+                    
+            let mut buffer = vec![0u8; total_data_bytes];
 
-                let mut target_byte = 0;
-                for ptr in ptrs {
+            let mut target_byte = 0;
+            for ptr in ptrs {
+                unsafe {   
                     let va_len = varsize_any(ptr);
                     std::ptr::copy(ptr as *const u8, std::ptr::addr_of_mut!(buffer[target_byte]), va_len);
                     target_byte += round_to_multiple(va_len, 8);
                 }
+            }
 
-                DatumStore {
-                    type_oid: oid.into(),
-                    data_len: total_data_bytes as u32,
-                    data: flat_serialize::Slice::Slice(buffer),
-                }
-            } else if tlen == -2 {
-                // Null terminated string, should not be possible in this context
-                panic!("Unexpected null-terminated string type encountered.");
-            } else {
-                // Fixed size reference
+            DatumStore {
+                type_oid: oid.into(),
+                data_len: total_data_bytes as u32,
+                data: buffer.into(),
+            }
+        } else if tlen == -2 {
+            // Null terminated string, should not be possible in this context
+            panic!("Unexpected null-terminated string type encountered.");
+        } else {
+            // Fixed size reference
 
-                // Round size to multiple of 8 bytes
-                let len = round_to_multiple(tlen as usize, 8);
-                let total_length = len * datums.len();
-                
-                let buffer = std::slice::from_raw_parts_mut(pg_sys::palloc0(total_length) as *mut u8, total_length);
-                for (i, datum) in datums.iter().enumerate() {
-                    std::ptr::copy(*datum as *const u8, std::ptr::addr_of_mut!(buffer[i * len]), tlen as usize);
-                }
+            // Round size to multiple of 8 bytes
+            let len = round_to_multiple(tlen as usize, 8);
+            let total_length = len * datums.len();
+            
+            let mut buffer = vec![0u8; total_length];
+            for (i, datum) in datums.iter().enumerate() {
+                unsafe {std::ptr::copy(*datum as *const u8, std::ptr::addr_of_mut!(buffer[i * len]), tlen as usize)};
+            }
 
-                DatumStore {
-                    type_oid: oid.into(),
-                    data_len: total_length as u32,
-                    data: flat_serialize::Slice::Slice(buffer),
-                }
+            DatumStore {
+                type_oid: oid.into(),
+                data_len: total_length as u32,
+                data: buffer.into(),
             }
         }
     }
@@ -355,5 +409,93 @@ impl<'a> IntoIterator for DatumStore<'a> {
                 }
             }
         }
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use super::*;
+    use pgx_macros::pg_test;
+    use crate::{
+        ron_inout_funcs,
+        pg_type,
+        build,
+        palloc::Inner,
+    };
+    use flat_serialize::*;
+    use aggregate_builder::*;
+
+    #[pg_schema]
+    pub mod toolkit_experimental {
+        use super::*;
+        pg_type! {
+            #[derive(Debug)]
+            struct DatumStoreTester<'input> {
+                datums: DatumStore<'input>,
+            }
+        }
+        ron_inout_funcs!(DatumStoreTester);
+
+        #[aggregate] impl toolkit_experimental::datum_test_agg {
+            type State = (Oid, Vec<Datum>);
+
+            fn transition(
+                state: Option<State>,
+                #[sql_type("AnyElement")] value: AnyElement,
+            ) -> Option<State> {
+                match state {
+                    Some((oid, mut vector)) => {
+                        unsafe {vector.push(deep_copy_datum(value.datum(),oid))};
+                        Some((oid, vector))
+                    }
+                    None => Some((value.oid(), vec!(unsafe {deep_copy_datum(value.datum(),value.oid())}))),
+                }
+            }
+
+            fn finally(state: Option<&mut State>) -> Option<DatumStoreTester<'static>> {
+                match state {
+                    None => None,
+                    Some(state) => Some(build!{
+                        DatumStoreTester {
+                            datums: DatumStore::from(std::mem::take(state)),
+                        }
+                    })
+                }
+            }
+        }
+    }
+
+    #[pg_test]
+    fn test_value_datum_store() {
+        Spi::execute(|client| {
+            let test = client.select("SELECT toolkit_experimental.datum_test_agg(r.data)::TEXT FROM (SELECT generate_series(10, 100, 10) as data) r", None, None)
+                .first()
+                .get_one::<String>().unwrap();                
+            let expected = "(version:1,datums:(type_oid:INT4,data_len:80,data:[10,0,0,0,0,0,0,0,20,0,0,0,0,0,0,0,30,0,0,0,0,0,0,0,40,0,0,0,0,0,0,0,50,0,0,0,0,0,0,0,60,0,0,0,0,0,0,0,70,0,0,0,0,0,0,0,80,0,0,0,0,0,0,0,90,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0]))";
+            assert_eq!(test, expected);
+        });
+    }
+
+    #[pg_test]
+    fn test_varlena_datum_store() {
+        Spi::execute(|client| {
+            let test = client.select("SELECT toolkit_experimental.datum_test_agg(r.data)::TEXT FROM (SELECT generate_series(10, 100, 10)::TEXT as data) r", None, None)
+                .first()
+                .get_one::<String>().unwrap();                
+            let expected = "(version:1,datums:(type_oid:TEXT,data_len:80,data:[24,0,0,0,49,48,0,0,24,0,0,0,50,48,0,0,24,0,0,0,51,48,0,0,24,0,0,0,52,48,0,0,24,0,0,0,53,48,0,0,24,0,0,0,54,48,0,0,24,0,0,0,55,48,0,0,24,0,0,0,56,48,0,0,24,0,0,0,57,48,0,0,28,0,0,0,49,48,48,0]))";
+            assert_eq!(test, expected);
+        });
+    }
+
+    #[pg_test]
+    fn test_byref_datum_store() {
+        Spi::execute(|client| {
+            let test = client.select("SELECT toolkit_experimental.datum_test_agg(r.data)::TEXT FROM (SELECT (generate_series(10, 100, 10)::TEXT || ' seconds')::INTERVAL as data) r", None, None)
+                .first()
+                .get_one::<String>().unwrap();                
+            let expected = "(version:1,datums:(type_oid:INTERVAL,data_len:160,data:[128,150,152,0,0,0,0,0,0,0,0,0,0,0,0,0,0,45,49,1,0,0,0,0,0,0,0,0,0,0,0,0,128,195,201,1,0,0,0,0,0,0,0,0,0,0,0,0,0,90,98,2,0,0,0,0,0,0,0,0,0,0,0,0,128,240,250,2,0,0,0,0,0,0,0,0,0,0,0,0,0,135,147,3,0,0,0,0,0,0,0,0,0,0,0,0,128,29,44,4,0,0,0,0,0,0,0,0,0,0,0,0,0,180,196,4,0,0,0,0,0,0,0,0,0,0,0,0,128,74,93,5,0,0,0,0,0,0,0,0,0,0,0,0,0,225,245,5,0,0,0,0,0,0,0,0,0,0,0,0]))";
+            assert_eq!(test, expected);
+        });
     }
 }
