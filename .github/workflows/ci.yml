@@ -8,9 +8,9 @@ on:
     - trying
   schedule:
     # TimescaleDB integration: 8am UTC, 3am Eastern, midnight Pacific
-    - cron: '0 8 * * 1-4'
+    # - cron: '0 8 * * 1-4'
     # Testing on every platform: 6am UTC, 1am Eastern, 10pm Pacific
-    - cron: '0 6 * * 1-4'
+    # - cron: '0 6 * * 1-4'
   workflow_dispatch:
     inputs:
       container-image:
